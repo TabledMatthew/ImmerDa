@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="./immerda.css">
+  <title>IMMER DA – Bremen Liefer-App</title>
+
+  <!-- Leaflet (Karte) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <!-- React + ReactDOM + Babel (für JSX im Browser) -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="logo"></div><h1 style="margin:0;font-size:20px">IMMER DA</h1>
+      </div>
+      <div class="tabs">
+        <button id="tabCustomer" class="active">Für Kund*innen</button>
+        <button id="tabRider">Für Fahrer</button>
+      </div>
+    </header>
+
+    <div id="root"></div>
+
+    <footer class="muted">© <span id="yr"></span> IMMER DA · Alle Fahrer versichert · 100% Trinkgeld an Fahrer</footer>
+  </div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // --- Storage mit Fallback ---
+    const mem = { users: [], current: null, orders: [] };
+    const get = k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } };
+    const set = (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+    function getUsers(){ return get('immerda_users') || mem.users; }
+    function setUsers(u){ mem.users=u; set('immerda_users', u); }
+    function getCurrent(){ return get('immerda_current') || mem.current; }
+    function setCurrent(u){ mem.current=u; set('immerda_current', u); }
+    function getOrders(){ return get('immerda_orders') || mem.orders; }
+    function setOrders(o){ mem.orders=o; set('immerda_orders', o); }
+
+    // --- Bremen Bounds & Distanz ---
+    const BOUNDS = { latMin:52.95, latMax:53.2, lonMin:8.5, lonMax:9.1 };
+    const toRad = d => d * Math.PI / 180;
+    const haversineKm = (a,b)=> {
+      const R=6371, dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
+      const la1=toRad(a.lat), la2=toRad(b.lat);
+      const h=Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(h));
+    };
+
+    // --- Leaflet Karte (nur Bremen) ---
+    function BremenMap({ pickup, setPickup, dropoff, setDropoff }){
+      const mapRef = useRef(null);
+      const mapInstanceRef = useRef(null);
+      const markersRef = useRef({ pick:null, drop:null });
+
+      useEffect(()=>{
+        const map = L.map(mapRef.current, { scrollWheelZoom:true }).setView([53.0793, 8.8017], 12);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap" }).addTo(map);
+        const bounds = L.latLngBounds([[BOUNDS.latMin, BOUNDS.lonMin],[BOUNDS.latMax, BOUNDS.lonMax]]);
+        map.setMaxBounds(bounds);
+        map.on('drag', ()=>{ map.panInsideBounds(bounds, { animate: false }); });
+        map.on('click', (e)=>{
+          if(!pickup){ setPickup({lat:e.latlng.lat, lon:e.latlng.lng}); }
+          else if(!dropoff){ setDropoff({lat:e.latlng.lat, lon:e.latlng.lng}); }
+          else { setPickup({lat:e.latlng.lat, lon:e.latlng.lng}); setDropoff(null); }
+        });
+        mapInstanceRef.current = map;
+        return ()=>map.remove();
+      },[]);
+
+      useEffect(()=>{
+        const map = mapInstanceRef.current; if(!map) return;
+        if(markersRef.current.pick){ map.removeLayer(markersRef.current.pick); markersRef.current.pick=null; }
+        if(markersRef.current.drop){ map.removeLayer(markersRef.current.drop); markersRef.current.drop=null; }
+        if(pickup){ markersRef.current.pick = L.marker([pickup.lat, pickup.lon]).addTo(map).bindPopup("Abholung"); }
+        if(dropoff){ markersRef.current.drop = L.marker([dropoff.lat, dropoff.lon]).addTo(map).bindPopup("Lieferung"); }
+      },[pickup,dropoff]);
+
+      return <div id="map" ref={mapRef}></div>;
+    }
+
+    // --- Adressfeld mit Vorschlägen (Nominatim, begrenzt auf Bremen) ---
+    function AddressInput({label, onSelect, placeholder, showExamples=true}) {
+      const [query,setQuery] = useState("");
+      const [sugs,setSugs] = useState([]);
+
+      useEffect(()=>{
+        const ctrl = new AbortController();
+        if(query.trim().length<3){ setSugs([]); return; }
+        const url=`https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&countrycodes=de&viewbox=8.5,52.95,9.1,53.2&bounded=1&q=${encodeURIComponent(query)}`;
+        fetch(url,{signal:ctrl.signal, headers:{'Accept-Language':'de'}})
+          .then(r=>r.json())
+          .then(d=> setSugs(d.map(x=>({ label:x.display_name, lat:+x.lat, lon:+x.lon }))))
+          .catch(()=>{});
+        return ()=>ctrl.abort();
+      },[query]);
+
+      return (
+        <div style={{position:'relative'}}>
+          <label>{label}</label>
+          <div className="muted" style={{fontSize:12, marginBottom:4}}>
+            {label === 'Abholadresse' ? 'Wähle ein Restaurant oder gib eine Adresse ein.' : 'Gib die Lieferadresse ein (z.B. Zuhause, Büro).'}
+          </div>
+          <input value={query} onChange={e=>setQuery(e.target.value)} placeholder={placeholder||'Adresse in Bremen eingeben'} />
+          {label === 'Abholadresse' && showExamples && (
+            <div style={{marginTop:6}}>
+              <div className="muted" style={{fontWeight:600}}>Beispiel-Restaurants:</div>
+              {[{name:'Pizza Bremen',desc:'Italienische Pizza, Am Wall 10',lat:53.080,lon:8.807},{name:'Asia Wok',desc:'Asiatische Küche, Bahnhofstr. 5',lat:53.083,lon:8.814},{name:'Veggie Corner',desc:'Vegetarisch, Ostertorsteinweg 45',lat:53.076,lon:8.823}].map((r,i)=>(
+                <div key={i} className="chip" style={{marginTop:4}} onClick={()=>{ onSelect({lat:r.lat,lon:r.lon}); setQuery(r.name+" - "+r.desc); setSugs([]); }}>
+                  {r.name} <span className="muted" style={{marginLeft:6}}>{r.desc}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {sugs.length>0 && (
+            <div className="suggestions">
+              {sugs.map((s,i)=> (
+                <div key={i} onClick={()=>{ onSelect({lat:s.lat, lon:s.lon}); setQuery(s.label); setSugs([]); }}>
+                  {s.label}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // --- Login ---
+    function LoginPanel({ onSuccess }){
+      const [email,setEmail]=React.useState('');
+      const [pw,setPw]=React.useState('');
+      const [msg,setMsg]=React.useState('');
+      const [resetMode,setResetMode]=React.useState(false);
+      const [newPw,setNewPw]=React.useState('');
+      const submit=(e)=>{
+        e.preventDefault(); setMsg('');
+        if(resetMode){
+          const users = getUsers();
+          const idx = users.findIndex(u=>u.email===email);
+          if(idx===-1){ setMsg('E-Mail nicht gefunden'); return; }
+          if(!newPw){ setMsg('Neues Passwort eingeben'); return; }
+          users[idx].pw = newPw; setUsers(users); setMsg('Passwort zurückgesetzt!'); setResetMode(false); setNewPw(''); setPw('');
+          return;
+        }
+        const u = getUsers().find(u=>u.email===email && u.pw===pw);
+        if(!u){ setMsg('Falsche Zugangsdaten'); return; }
+        setCurrent(u); onSuccess(u);
+      };
+      return (
+        <form onSubmit={submit} className="card" style={{marginBottom:12}}>
+          <h3 style={{marginTop:0}}>Anmelden</h3>
+          <label>E-Mail</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="du@example.com"/>
+          <label>Passwort</label>
+          {!resetMode ? (
+            <input type="password" value={pw} onChange={e=>setPw(e.target.value)} />
+          ) : (
+            <input type="password" value={newPw} onChange={e=>setNewPw(e.target.value)} placeholder="Neues Passwort" />
+          )}
+          <div className="muted" style={{minHeight:18, marginTop:6}}>{msg}</div>
+          <button className="btn btn-primary">{resetMode ? 'Passwort zurücksetzen' : 'Anmelden'}</button>
+          <div style={{marginTop:8}}>
+            {!resetMode ? (
+              <button type="button" className="btn btn-ghost" style={{fontSize:13}} onClick={()=>setResetMode(true)}>Passwort vergessen?</button>
+            ) : (
+              <button type="button" className="btn btn-ghost" style={{fontSize:13}} onClick={()=>setResetMode(false)}>Zurück zum Login</button>
+            )}
+          </div>
+        </form>
+      );
+    }
+
+    // --- Registrierung Kunde ---
+    function SignupCustomer({ onSuccess }){
+  const [name,setName]=useState('');
+  const [username,setUsername]=useState('');
+      const [phone,setPhone]=useState('');
+      const [email,setEmail]=useState('');
+      const [pw,setPw]=useState('');
+      const [msg,setMsg]=useState('');
+      const submit= e=>{
+        e.preventDefault(); setMsg('');
+        if(!name||!username||!phone||!email||!pw){ setMsg('Bitte alle Felder ausfüllen'); return; }
+        const users=getUsers();
+        if(users.find(u=>u.email===email)){ setMsg('E-Mail bereits registriert'); return; }
+        if(users.find(u=>u.username===username)){ setMsg('Username bereits vergeben'); return; }
+        const u={role:'customer', name, username, phone, email, pw};
+        users.push(u); setUsers(users); setCurrent(u); onSuccess(u);
+      };
+      return (
+        <form onSubmit={submit} className="card" style={{marginBottom:12}}>
+          <h3 style={{marginTop:0}}>Kund*in registrieren</h3>
+          <label>Name</label>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="Vollständiger Name"/>
+          <label>Username</label>
+          <input value={username} onChange={e=>setUsername(e.target.value)} placeholder="z.B. pizzaFan123"/>
+          <label>Telefonnummer</label>
+          <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="+49 ..."/>
+          <label>E-Mail</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="du@example.com"/>
+          <label>Passwort</label>
+          <input type="password" value={pw} onChange={e=>setPw(e.target.value)} />
+          <div className="muted" style={{minHeight:18, marginTop:6}}>{msg}</div>
+          <button className="btn btn-success">Konto erstellen</button>
+        </form>
+      );
+    }
+
+    // --- Registrierung Fahrer (mit KYC Uploads) ---
+    function SignupRider({ onSuccess }){
+  const [name,setName]=useState('');
+  const [username,setUsername]=useState('');
+      const [phone,setPhone]=useState('');
+      const [email,setEmail]=useState('');
+      const [pw,setPw]=useState('');
+      const [profilePic,setProfilePic]=useState('');
+      const [selfieName,setSelfieName]=useState('');
+      const [idImage,setIdImage]=useState('');
+      const [msg,setMsg]=useState('');
+
+      const dataUrl = file => new Promise((res,rej)=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.onerror=rej; file && fr.readAsDataURL(file); });
+
+      const onFile = async (file, setter) => { if(!file) return; const url = await dataUrl(file); setter(url); };
+
+      const submit= async (e)=>{
+        e.preventDefault(); setMsg('');
+        if(!name||!username||!phone||!email||!pw||!profilePic||!selfieName||!idImage){ setMsg('Bitte alle Felder inkl. 3 Fotos ausfüllen'); return; }
+        const users=getUsers();
+        if(users.find(u=>u.email===email)){ setMsg('E-Mail bereits registriert'); return; }
+        if(users.find(u=>u.username===username)){ setMsg('Username bereits vergeben'); return; }
+        const u={role:'rider', name, username, phone, email, pw, profilePic, selfieName, idImage, ratings:[], wallet:{fees:0,tips:0}};
+        users.push(u); setUsers(users); setCurrent(u); onSuccess(u);
+      };
+
+      return (
+        <form onSubmit={submit} className="card" style={{marginBottom:12}}>
+          <h3 style={{marginTop:0}}>Fahrer registrieren (Verifizierung)</h3>
+          <label>Name</label>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="Vollständiger Name"/>
+          <label>Username</label>
+          <input value={username} onChange={e=>setUsername(e.target.value)} placeholder="z.B. speedyRider"/>
+          <label>Telefonnummer</label>
+          <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="+49 ..."/>
+          <label>E-Mail</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="du@example.com"/>
+          <label>Passwort</label>
+          <input type="password" value={pw} onChange={e=>setPw(e.target.value)} />
+
+          <div className="row">
+            <div style={{flex:1,minWidth:220}}>
+              <label>Profilbild (Gesicht deutlich)</label>
+              <input type="file" accept="image/*" onChange={e=>onFile(e.target.files?.[0], setProfilePic)}/>
+              {profilePic && <img className="avatar" src={profilePic} alt="Profilbild Vorschau" style={{marginTop:6}}/>}
+            </div>
+            <div style={{flex:1,minWidth:220}}>
+              <label>Selfie mit Namensschild</label>
+              <input type="file" accept="image/*" onChange={e=>onFile(e.target.files?.[0], setSelfieName)}/>
+              {selfieName && <div className="tag" style={{marginTop:6}}>hochgeladen</div>}
+            </div>
+            <div style={{flex:1,minWidth:220}}>
+              <label>Ausweisfoto</label>
+              <input type="file" accept="image/*" onChange={e=>onFile(e.target.files?.[0], setIdImage)}/>
+              {idImage && <div className="tag" style={{marginTop:6}}>hochgeladen</div>}
+            </div>
+          </div>
+
+          <div className="muted" style={{minHeight:18, marginTop:6}}>{msg}</div>
+          <button className="btn btn-success">Konto erstellen</button>
+        </form>
+      );
+    }
+
+    // --- Kundenseite ---
+    function CustomerPage(){
+      const [pickup, setPickup] = React.useState(null);
+  const [dropoff, setDropoff] = React.useState(null);
+      const current = getCurrent();
+      const isCustomer = current && current.role==='customer';
+      const [showModal, setShowModal] = React.useState(null); // 'signup' or 'login'
+      const restaurantExamples = [
+        {name:'Pizza Bremen',desc:'Italienische Pizza, Am Wall 10',lat:53.080,lon:8.807},
+        {name:'Asia Wok',desc:'Asiatische Küche, Bahnhofstr. 5',lat:53.083,lon:8.814},
+        {name:'Veggie Corner',desc:'Vegetarisch, Ostertorsteinweg 45',lat:53.076,lon:8.823}
+      ];
+      return (
+        <main>
+          <header className="card" style={{margin:'0 0 24px 0',padding:'24px',borderRadius:'18px',background:'linear-gradient(90deg,#0ea5e9 0%,#22c55e 100%)',color:'#fff',boxShadow:'0 4px 24px rgba(0,0,0,0.08)'}}>
+            <h1 style={{margin:'0 0 8px 0',fontSize:'2.2rem',fontWeight:800}}>IMMER DA – Ready Pickup Service</h1>
+            <p style={{margin:'0 0 4px 0',fontSize:'1.15rem',fontWeight:500}}>Schnelle Hilfe für alle – inkl. Menschen mit Behinderung. Wir holen, liefern und unterstützen dich in Bremen!</p>
+          </header>
+          {!isCustomer && (
+            <div className="grid" style={{marginBottom:12}}>
+              <button className="btn btn-success" style={{fontSize:18,padding:'14px 20px'}} onClick={()=>setShowModal('signup')}>Konto erstellen</button>
+              <button className="btn btn-primary" style={{fontSize:18,padding:'14px 20px'}} onClick={()=>setShowModal('login')}>Anmelden</button>
+            </div>
+          )}
+          <div className="grid" style={{gridTemplateColumns:'1fr 1fr',gap:'32px',alignItems:'start'}}>
+            <aside className="card" style={{maxWidth:'600px',margin:'0 auto'}}>
+              <ul style={{margin:'0 0 8px 16px', padding:0}}>
+                <li>Basis: €2,00 je Auftrag</li>
+                <li>Fairer km-Preis: €0,75/km (Luftlinie)</li>
+                <li>Größenaufschlag: Mittel +€0,50 · Groß +€1,00</li>
+                <li>Trinkgeld: 100% geht an den Fahrer</li>
+              </ul>
+              <div className="muted" style={{fontWeight:600,marginTop:16}}>Beispiel-Restaurants:</div>
+              <div style={{marginBottom:16}}>
+                {restaurantExamples.map((r,i)=>(
+                  <div key={i} className="chip" style={{marginTop:4,display:'block',width:'fit-content',cursor:'pointer'}} onClick={()=>setPickup({lat:r.lat,lon:r.lon})}>
+                    {r.name} <span className="muted" style={{marginLeft:6}}>{r.desc}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mapWrap" style={{height:'320px',borderRadius:'16px',overflow:'hidden',boxShadow:'0 2px 12px rgba(0,0,0,0.07)',background:'#fff',marginBottom:'10px'}}>
+                <BremenMap pickup={pickup} setPickup={setPickup} dropoff={dropoff} setDropoff={setDropoff}/>
+                <div className="notice" style={{fontSize:'15px',padding:'8px 0',textAlign:'center'}}>Karte ist auf <b>Bremen</b> begrenzt. 1. Klick setzt <b>Abholung</b>, 2. Klick <b>Lieferung</b>, 3. Klick ersetzt Abholung.</div>
+                <div className="muted" style={{fontSize:11,marginTop:4,textAlign:'center'}}><span style={{color:'#888'}}>Leaflet | © OpenStreetMap</span></div>
+              </div>
+            </aside>
+            <RequestForm pickup={pickup} setPickup={setPickup} dropoff={dropoff} setDropoff={setDropoff} showExamples={false} />
+          </div>
+          {showModal && (
+            <div style={{position:'fixed',top:0,left:0,width:'100vw',height:'100vh',background:'rgba(0,0,0,0.35)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <div className="card" style={{maxWidth:400,padding:24,boxShadow:'0 8px 32px rgba(0,0,0,0.18)',borderRadius:18,background:'#fff',position:'relative'}}>
+                <button style={{position:'absolute',top:10,right:10,fontSize:18,border:'none',background:'none',cursor:'pointer'}} onClick={()=>setShowModal(null)}>&times;</button>
+                {showModal==='signup' ? (
+                  <>
+                    <SignupCustomer onSuccess={()=>{setShowModal(null); window.location.reload();}} />
+                    <div style={{marginTop:10,textAlign:'center'}}>
+                      <span className="muted">Schon ein Konto?</span>
+                      <button className="btn btn-ghost" style={{marginLeft:8}} onClick={()=>setShowModal('login')}>Anmelden</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <LoginPanel onSuccess={()=>{setShowModal(null); window.location.reload();}} />
+                    <div style={{marginTop:10,textAlign:'center'}}>
+                      <span className="muted">Noch kein Konto?</span>
+                      <button className="btn btn-ghost" style={{marginLeft:8}} onClick={()=>setShowModal('signup')}>Konto erstellen</button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </main>
+      );
+    }
+
+    function RequestForm({pickup, setPickup, dropoff, setDropoff, showExamples}){
+      const BASE = 2.0, PER_KM = 0.75, SUR = { small:0, medium:0.5, large:1 };
+      const [pickupState, setPickupState] = React.useState(pickup);
+      const [dropoffState, setDropoffState] = React.useState(dropoff);
+      const [size, setSize] = React.useState('small');
+      const [tip, setTip] = React.useState('');
+      const [price, setPrice] = React.useState(null);
+      const [breakdown, setBreakdown] = React.useState('Noch keine Strecke');
+      const [assigned, setAssigned] = React.useState(null);
+      const [ratingStage, setRatingStage] = React.useState(false);
+      const [stars, setStars] = React.useState(0);
+      const [showSignup, setShowSignup] = React.useState(false);
+      const [instructions, setInstructions] = React.useState('');
+      const subTotal = React.useMemo(()=>{
+        if (!pickupState || !dropoffState) return BASE + SUR[size];
+        const km = haversineKm(pickupState, dropoffState);
+        return BASE + km * PER_KM + SUR[size];
+      }, [pickupState, dropoffState, size]);
+
+      const tipPercent = (p)=>{
+        const t = Math.round(subTotal * p * 100)/100;
+        setTip(t.toFixed(2));
+      };
+
+      const calc = ()=>{
+        if (!pickupState || !dropoffState){ alert('Bitte Abholung und Lieferung setzen (Karte oder Adresse).'); return; }
+        const km = haversineKm(pickupState, dropoffState);
+        const tipVal = parseFloat(tip || '0') || 0;
+        const total = BASE + km * PER_KM + SUR[size] + tipVal;
+        setPrice(total.toFixed(2));
+        setBreakdown(`~${km.toFixed(2)} km · Basis €${BASE.toFixed(2)} + km €${(km*PER_KM).toFixed(2)} + Größe €${SUR[size].toFixed(2)} + Trinkgeld €${tipVal.toFixed(2)}`);
+      };
+
+      const submit = ()=>{
+        const current = getCurrent();
+        if (!current || current.role !== 'customer') {
+          setShowSignup(true);
+          return;
+        }
+        if (!price){ alert('Bitte zuerst Preis berechnen.'); return; }
+        const orders = getOrders();
+        const id = 'ord_'+Date.now();
+        const order = { id, pickup:pickupState, dropoff:dropoffState, size, tip: parseFloat(tip||'0')||0, price: parseFloat(price), status:'erstellt', instructions };
+
+        const riders = getUsers().filter(u=>u.role==='rider' && u.available);
+        if(riders.length>0){
+          const r = riders[Math.floor(Math.random()*riders.length)];
+          order.riderEmail = r.email; order.status = 'zugewiesen'; setAssigned(r.email);
+          r.wallet = r.wallet || {fees:0,tips:0};
+          r.wallet.fees += (order.price - order.tip);
+          r.wallet.tips += order.tip;
+          const us = getUsers().map(u=> u.email===r.email ? r : u);
+          setUsers(us);
+        }
+
+        orders.push(order); setOrders(orders);
+        alert('Auftrag erstellt' + (order.riderEmail?` und zugewiesen an ${order.riderEmail}`:' (noch kein Fahrer online)'));
+        if(order.riderEmail){ setRatingStage(true); }
+      };
+
+      const saveRating = ()=>{
+        if(!assigned){ setRatingStage(false); return; }
+        const users = getUsers();
+        const r = users.find(u=>u.email===assigned);
+        if(r){ r.ratings = r.ratings || []; r.ratings.push(stars); setUsers(users.map(u=>u.email===r.email? r:u)); }
+        const orders = getOrders();
+        const last = orders[orders.length-1]; if(last) { last.rating = stars; setOrders(orders); }
+        setRatingStage(false); alert('Danke für die Bewertung!');
+      };
+
+      useEffect(() => {
+        setPickupState(pickup);
+        setDropoffState(dropoff);
+      }, [pickup, dropoff]);
+
+      return (
+        <section className="card" style={{width:'100%',maxWidth:'600px',margin:'0 auto',borderRadius:'18px',boxShadow:'0 8px 32px rgba(0,0,0,0.08)',padding:'32px 28px',background:'#fff',display:'block'}}>
+      <h3 style={{margin:'0 0 18px 0',textAlign:'center',fontSize:'1.5rem'}}>Lieferung anfragen</h3>
+      <div style={{marginBottom:18}}>
+        <AddressInput label="Abholadresse" onSelect={ll=>setPickup(ll)} placeholder="Abholadresse in Bremen" showExamples={showExamples}/>
+      </div>
+      <div style={{marginBottom:18}}>
+        <AddressInput label="Lieferadresse" onSelect={ll=>setDropoff(ll)} placeholder="Lieferadresse in Bremen"/>
+      </div>
+      <div style={{marginBottom:18}}>
+        <label>Instruktionen für Fahrer</label>
+        <textarea value={instructions} onChange={e=>setInstructions(e.target.value)} placeholder="Was soll abgeholt werden? Gibt es Besonderheiten?" style={{width:'100%',borderRadius:'10px',padding:'12px',fontSize:'16px',resize:'none',minHeight:'70px'}} />
+        <div className="muted" style={{fontSize:12}}>Beschreibe, was der Fahrer abholen soll (z.B. Pizza, Einkauf, Paket) und besondere Hinweise.</div>
+      </div>
+      <div style={{marginBottom:18}}>
+        <label>Paketgröße</label>
+        <select value={size} onChange={e=>setSize(e.target.value)} style={{width:'100%',borderRadius:'10px',padding:'10px',fontSize:'16px'}}>
+          <option value="small">Klein</option>
+          <option value="medium">Mittel (+€0,50)</option>
+          <option value="large">Groß (+€1,00)</option>
+        </select>
+      </div>
+      <div style={{marginBottom:18}}>
+        <label>Trinkgeld (optional)</label>
+        <input value={tip} onChange={e=>setTip(e.target.value)} placeholder="z. B. 1.00" inputMode="decimal" style={{width:'100%',borderRadius:'10px',padding:'10px',fontSize:'16px',marginBottom:6}}/>
+        <div style={{marginTop:6}}>
+          <button type="button" className="chip" onClick={()=>setTip('0.50')}>€0,50</button>
+          <button type="button" className="chip" onClick={()=>setTip('1.00')}>€1,00</button>
+          <button type="button" className="chip" onClick={()=>setTip('2.00')}>€2,00</button>
+          <button type="button" className="chip" onClick={()=>tipPercent(0.10)}>+10%</button>
+          <button type="button" className="chip" onClick={()=>tipPercent(0.15)}>+15%</button>
+          <button type="button" className="chip" onClick={()=>tipPercent(0.20)}>+20%</button>
+        </div>
+        <div className="muted" style={{fontSize:12, marginTop:4}}>100% des Trinkgelds geht an den Fahrer.</div>
+      </div>
+      <div style={{marginBottom:18}}>
+        <button type="button" onClick={calc} className="btn btn-primary" style={{width:'100%',fontSize:'1.1rem',padding:'12px 0'}}>Preis berechnen</button>
+        <div style={{textAlign:'right',marginTop:8}}>
+          <div className="price">{price ? '€'+price : '€—'}</div>
+          <div className="muted" style={{fontSize:12}}>{breakdown}</div>
+        </div>
+      </div>
+      <button onClick={submit} className="btn btn-success" disabled={!price} style={{width:'100%',marginTop:8,fontSize:'1.1rem',padding:'12px 0'}}>Bestellung bestätigen</button>
+      {ratingStage && (
+        <div className="card" style={{marginTop:10}}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+            <div>Fahrer bewerten</div>
+            <div className="rating">
+              {[1,2,3,4,5].map(n=> (
+                <span key={n} className="star" onClick={()=>setStars(n)} style={{cursor:'pointer'}}>{n<=stars?'★':'☆'}</span>
+              ))}
+            </div>
+          </div>
+          <button className="btn btn-primary" style={{marginTop:8}} onClick={saveRating} disabled={stars===0}>Bewertung senden</button>
+        </div>
+      )}
+      {showSignup && (
+        <div style={{position:'fixed',top:0,left:0,width:'100vw',height:'100vh',background:'rgba(0,0,0,0.35)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          <div className="card" style={{maxWidth:400,padding:24,boxShadow:'0 8px 32px rgba(0,0,0,0.18)',borderRadius:18,background:'#fff',position:'relative'}}>
+            <button style={{position:'absolute',top:10,right:10,fontSize:18,border:'none',background:'none',cursor:'pointer'}} onClick={()=>setShowSignup(false)}>&times;</button>
+            <SignupCustomer onSuccess={()=>{setShowSignup(false); window.location.reload();}} />
+          </div>
+        </div>
+      )}
+    </section>
+      );
+    }
+
+    // --- Fahrerseite ---
+    function RiderPage(){
+      const [_, force] = React.useState(0);
+      const current = getCurrent();
+      const isRider = current && current.role==='rider';
+      const [showModal, setShowModal] = React.useState(null); // 'signup' or 'login'
+      const [showOrders, setShowOrders] = React.useState(false);
+      const [notifOrders, setNotifOrders] = React.useState([]);
+
+      React.useEffect(()=>{
+        if(isRider){
+          // Show unassigned orders as notifications
+          const orders = getOrders().filter(o=>!o.riderEmail && o.status==='erstellt');
+          setNotifOrders(orders);
+        }
+      }, [isRider, getOrders()]);
+
+      const acceptOrder = (orderId) => {
+        const orders = getOrders();
+        const idx = orders.findIndex(o=>o.id===orderId);
+        if(idx>-1 && current){
+          orders[idx].riderEmail = current.email;
+          orders[idx].status = 'zugewiesen';
+          current.wallet = current.wallet || {fees:0,tips:0};
+          current.wallet.fees += (orders[idx].price - orders[idx].tip);
+          current.wallet.tips += orders[idx].tip;
+          setOrders(orders);
+          const users = getUsers().map(u=>u.email===current.email ? current : u);
+          setUsers(users);
+          force(x=>x+1);
+          setNotifOrders(notifOrders.filter(o=>o.id!==orderId));
+          alert('Auftrag angenommen!');
+        }
+      };
+
+      return (
+        <main>
+          <header className="card" style={{margin:'0 0 24px 0',padding:'24px',borderRadius:'18px',background:'linear-gradient(90deg,#0ea5e9 0%,#22c55e 100%)',color:'#fff',boxShadow:'0 4px 24px rgba(0,0,0,0.08)'}}>
+        <h1 style={{margin:'0 0 8px 0',fontSize:'2.1rem',fontWeight:800}}>Werde Fahrer – Dein flexibler Nebenjob in Bremen</h1>
+        <p style={{margin:'0 0 4px 0',fontSize:'1.1rem',fontWeight:500}}>Ob Student, Azubi, Expat oder Immigrant: Bei uns kannst du unkompliziert und legal als Fahrer*in arbeiten, flexibel Geld verdienen und Bremen besser kennenlernen.</p>
+        <ul style={{margin:'12px 0 0 18px',fontSize:'1rem',color:'#e5e7eb',fontWeight:500}}>
+          <li>Flexible Arbeitszeiten – du entscheidest, wann du fährst</li>
+          <li>100% Trinkgeld, faire Bezahlung</li>
+          <li>Lieferungen meist innerhalb von 5km</li>
+          <li>Versicherungsschutz für alle Fahrer*innen</li>
+          <li>Einfacher Einstieg, auch mit Nebenjob-Erlaubnis</li>
+        </ul>
+        <div style={{marginTop:'10px',fontSize:'1rem',color:'#e5e7eb'}}>Was wir erwarten: Zuverlässigkeit, Freundlichkeit und pünktliche Lieferung im Umkreis von 5km.</div>
+      </header>
+          {!isRider && (
+            <div className="grid" style={{marginBottom:12}}>
+              <button className="btn btn-success" style={{fontSize:18,padding:'14px 20px'}} onClick={()=>setShowModal('signup')}>Konto erstellen</button>
+              <button className="btn btn-primary" style={{fontSize:18,padding:'14px 20px'}} onClick={()=>setShowModal('login')}>Anmelden</button>
+            </div>
+          )}
+          {isRider && (
+            <section className="card">
+              <div className="topbar" style={{justifyContent:'space-between'}}>
+                <div style={{display:'flex',alignItems:'center',gap:10}}>
+                  <img src={current.profilePic} className="avatar" alt="Profilbild"/>
+                  <div>
+                    <div style={{fontWeight:700}}>{current.name}</div>
+                    <div className="rating" title={`Durchschnitt: ${avgRating(current)}`}>
+                      {Array.from({length:5}).map((_,i)=> <span key={i} className="star">{i < Math.round(avgRating(current)) ? '★' : '☆'}</span>)}
+                      <span className="muted" style={{marginLeft:6}}>({(current.ratings||[]).length})</span>
+                    </div>
+                    <div className="muted" style={{fontSize:12}}>{current.email} · {current.phone}</div>
+                  </div>
+                </div>
+                <div>
+                  <button className="btn btn-ghost" onClick={()=>{ setCurrent(null); window.location.reload(); }}>Abmelden</button>
+                </div>
+              </div>
+              <div className="row" style={{marginTop:10,alignItems:'center'}}>
+                <div className="tag">Selfie/Name: {current.selfieName? '✔' : '—'}</div>
+                <div className="tag">Ausweis: {current.idImage? '✔' : '—'}</div>
+                <button className="btn" onClick={toggleAvail} style={{marginLeft:'auto'}}>{current.available? 'Offline gehen' : 'Online gehen'}</button>
+              </div>
+              {/* Notifications for new orders */}
+              {notifOrders.length > 0 && (
+                <div className="card" style={{marginTop:16,background:'#f0f9ff'}}>
+                  <h3 style={{marginTop:0}}>Neue Aufträge</h3>
+                  <ul className="list">
+                    {notifOrders.map(o=>(
+                      <li key={o.id}>
+                        <div>
+                          <div className="muted" style={{fontSize:12}}>#{o.id.slice(-6)}</div>
+                          <div>€{o.price.toFixed(2)} · {o.size}</div>
+                          {o.instructions && <div className="muted" style={{fontSize:13,marginTop:2}}><b>Instruktionen:</b> {o.instructions}</div>}
+                        </div>
+                        <button className="btn btn-primary" onClick={()=>acceptOrder(o.id)}>Annehmen</button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <div className="grid" style={{marginTop:12}}>
+                <div className="card">
+                  <h3 style={{marginTop:0}}>Wallet</h3>
+                  <div className="row">
+                    <div className="card" style={{flex:1}}>
+                      <div className="muted">Liefergebühren</div>
+                      <div className="price">€{(current.wallet?.fees||0).toFixed(2)}</div>
+                    </div>
+                    <div className="card" style={{flex:1}}>
+                      <div className="muted">Trinkgelder</div>
+                      <div className="price">€{(current.wallet?.tips||0).toFixed(2)}</div>
+                    </div>
+                    <div className="card" style={{flex:1}}>
+                      <div className="muted">Gesamt</div>
+                      <div className="price">€{(((current.wallet?.fees||0)+(current.wallet?.tips||0))).toFixed(2)}</div>
+                    </div>
+                  </div>
+                  <button className="btn btn-primary" style={{marginTop:8}} onClick={withdraw}>Auszahlen (Demo)</button>
+                </div>
+                <div className="card">
+                  <h3 style={{marginTop:0}}>Letzte Aufträge</h3>
+                  <ul className="list">
+                    {getOrders().filter(o=>o.riderEmail===current.email).slice(-5).reverse().map(o=> (
+                      <li key={o.id}>
+                        <div>
+                          <div className="muted" style={{fontSize:12}}>#{o.id.slice(-6)}</div>
+                          <div>€{o.price.toFixed(2)} · {o.size} · {o.rating? `Bewertung ${o.rating}/5` : 'Unbewertet'}</div>
+                          {o.instructions && <div className="muted" style={{fontSize:13,marginTop:2}}><b>Instruktionen:</b> {o.instructions}</div>}
+                        </div>
+                        <span className="tag">{o.status}</span>
+                      </li>
+                    ))}
+                    {getOrders().filter(o=>o.riderEmail===current.email).length===0 && (
+                      <li className="muted">Noch keine Aufträge</li>
+                    )}
+                  </ul>
+                </div>
+              </div>
+            </section>
+          )}
+          {showModal && (
+        <div style={{position:'fixed',top:0,left:0,width:'100vw',height:'100vh',background:'rgba(0,0,0,0.35)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          <div className="card" style={{maxWidth:400,padding:24,boxShadow:'0 8px 32px rgba(0,0,0,0.18)',borderRadius:18,background:'#fff',position:'relative'}}>
+            <button style={{position:'absolute',top:10,right:10,fontSize:18,border:'none',background:'none',cursor:'pointer'}} onClick={()=>setShowModal(null)}>&times;</button>
+            {showModal==='signup' ? (
+              <>
+                <SignupRider onSuccess={()=>{setShowModal(null); window.location.reload();}} />
+                <div style={{marginTop:10,textAlign:'center'}}>
+                  <span className="muted">Schon ein Konto?</span>
+                  <button className="btn btn-ghost" style={{marginLeft:8}} onClick={()=>setShowModal('login')}>Anmelden</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <LoginPanel onSuccess={()=>{setShowModal(null); window.location.reload();}} />
+                <div style={{marginTop:10,textAlign:'center'}}>
+                  <span className="muted">Noch kein Konto?</span>
+                  <button className="btn btn-ghost" style={{marginLeft:8}} onClick={()=>setShowModal('signup')}>Konto erstellen</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </main>
+  );
+    }
+
+    // --- Kundenseite Dashboard ---
+    function CustomerDashboard({ current }) {
+      const orders = getOrders().filter(o => o.customerEmail === current.email);
+      return (
+        <section className="card" style={{marginBottom:24}}>
+          <h2 style={{marginTop:0}}>Willkommen, {current.username}!</h2>
+          <div className="muted" style={{marginBottom:12}}>Hier findest du deine aktuellen und bisherigen Aufträge.</div>
+          <h3>Deine Aufträge</h3>
+          <ul className="list">
+            {orders.length === 0 && <li className="muted">Noch keine Aufträge</li>}
+            {orders.map(o => (
+              <li key={o.id}>
+                <div>
+                  <div className="muted" style={{fontSize:12}}>#{o.id.slice(-6)}</div>
+                  <div>€{o.price.toFixed(2)} · {o.size} · {o.status}</div>
+                  {o.instructions && <div className="muted" style={{fontSize:13,marginTop:2}}><b>Instruktionen:</b> {o.instructions}</div>}
+                </div>
+                <span className="tag">{o.status}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      );
+    }
+
+    // --- Fahrerseite Dashboard ---
+    function RiderDashboard({ current }) {
+      const orders = getOrders().filter(o => o.riderEmail === current.email);
+      return (
+        <section className="card" style={{marginBottom:24}}>
+          <h2 style={{marginTop:0}}>Willkommen, {current.username}!</h2>
+          <div className="muted" style={{marginBottom:12}}>Hier findest du deine aktuellen und bisherigen Lieferungen.</div>
+          <h3>Deine Lieferungen</h3>
+          <ul className="list">
+            {orders.length === 0 && <li className="muted">Noch keine Lieferungen</li>}
+            {orders.map(o => (
+              <li key={o.id}>
+                <div>
+                  <div className="muted" style={{fontSize:12}}>#{o.id.slice(-6)}</div>
+                  <div>€{o.price.toFixed(2)} · {o.size} · {o.status}</div>
+                  {o.instructions && <div className="muted" style={{fontSize:13,marginTop:2}}><b>Instruktionen:</b> {o.instructions}</div>}
+                </div>
+                <span className="tag">{o.status}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      );
+    }
+
+    // --- App Wrapper ---
+    function App(){
+      const [tab, setTab] = React.useState('customer');
+      const [current, setCurrentState] = React.useState(getCurrent());
+      React.useEffect(()=>{ const onStorage=()=>setCurrentState(getCurrent()); window.addEventListener('storage', onStorage); return ()=>window.removeEventListener('storage', onStorage); }, []);
+      React.useEffect(()=>{
+        const c = document.getElementById('tabCustomer');
+        const r = document.getElementById('tabRider');
+        const onC = ()=>{ setTab('customer'); c.classList.add('active'); r.classList.remove('active'); };
+        const onR = ()=>{ setTab('rider'); r.classList.add('active'); c.classList.remove('active'); };
+        c.onclick = onC; r.onclick = onR;
+      }, []);
+      return (
+        <>
+          {current && (
+        <div className="card" style={{marginBottom:12}}>
+          <div className="topbar">
+            <div>Angemeldet als: <b>{`${current.name||current.email} (${current.role==='customer'?'Kund*in':'Fahrer'})`}</b></div>
+            <button className="btn" onClick={()=>{ setCurrent(null); setCurrentState(null); }}>Abmelden</button>
+          </div>
+        </div>
+      )}
+          {current && current.role === 'customer' && <CustomerDashboard current={current} />}
+          {current && current.role === 'rider' && <RiderDashboard current={current} />}
+          {tab==='customer' ? <CustomerPage/> : <RiderPage/>}
+        </>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+
+    document.getElementById('yr').textContent = new Date().getFullYear();
+  </script>
+</body>
+</html>
