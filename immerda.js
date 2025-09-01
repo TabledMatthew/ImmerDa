@@ -1,5 +1,4 @@
-
-    const { useState, useEffect, useMemo, useRef } = React;
+ const { useState, useEffect, useMemo, useRef } = React;
 
     // --- Storage mit Fallback ---
     const mem = { users: [], current: null, orders: [] };
@@ -711,4 +710,3 @@
     root.render(<App />);
 
     document.getElementById('yr').textContent = new Date().getFullYear();
-  
